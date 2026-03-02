@@ -7,14 +7,16 @@ Features:
 2) Continuous CLI monitor (watch)
 3) Local web dashboard (serve)
 
-Data source: OpenSky Network states API
-https://opensky-network.org/apidoc/rest.html
+Data sources:
+- OpenSky Network states API
+- adsb.lol public API
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import threading
 import time
 from collections import defaultdict, deque
@@ -28,9 +30,15 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
+ADSB_LOL_POINT_URL = "https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{radius_nm}"
 USER_AGENT = "MiddleEastFlightTracker/1.0"
 FEET_PER_METER = 3.28084
+METER_PER_FOOT = 0.3048
 KMH_PER_MPS = 3.6
+MPS_PER_KNOT = 0.514444
+MPS_PER_FPM = 0.00508
+
+SUPPORTED_PROVIDERS = ("opensky", "adsb-lol")
 
 
 class FlightDataError(RuntimeError):
@@ -115,10 +123,28 @@ def _to_feet(meters: float | None) -> int | None:
     return int(round(meters * FEET_PER_METER))
 
 
+def _feet_to_meters(feet: float | None) -> float | None:
+    if feet is None:
+        return None
+    return float(feet) * METER_PER_FOOT
+
+
 def _to_kmh(mps: float | None) -> int | None:
     if mps is None:
         return None
     return int(round(mps * KMH_PER_MPS))
+
+
+def _knots_to_mps(knots: float | None) -> float | None:
+    if knots is None:
+        return None
+    return float(knots) * MPS_PER_KNOT
+
+
+def _fpm_to_mps(feet_per_minute: float | None) -> float | None:
+    if feet_per_minute is None:
+        return None
+    return float(feet_per_minute) * MPS_PER_FPM
 
 
 def _safe_age_seconds(last_contact: int | None, now_ts: int) -> int | None:
@@ -143,6 +169,53 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def parse_provider_order(raw_value: str) -> list[str]:
+    if not raw_value.strip():
+        raise ValueError("--providers cannot be empty")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for token in raw_value.split(","):
+        provider = token.strip().lower().replace("_", "-")
+        if provider == "adsblol":
+            provider = "adsb-lol"
+        if provider not in SUPPORTED_PROVIDERS:
+            supported = ", ".join(SUPPORTED_PROVIDERS)
+            raise ValueError(f"Unsupported provider '{provider}'. Supported: {supported}")
+        if provider not in seen:
+            normalized.append(provider)
+            seen.add(provider)
+
+    if not normalized:
+        raise ValueError("--providers must include at least one valid provider")
+    return normalized
+
+
+def request_json(url: str, *, timeout: int, provider: str) -> dict[str, Any]:
+    request = Request(
+        url,
+        headers={"User-Agent": USER_AGENT},
+        method="GET",
+    )
+
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                raise FlightDataError(f"{provider} returned status code: {response.status}")
+            raw = response.read().decode("utf-8")
+    except HTTPError as exc:
+        raise FlightDataError(f"{provider} request failed: HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise FlightDataError(f"{provider} network error: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise FlightDataError(f"{provider} request timed out") from exc
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise FlightDataError(f"{provider} returned invalid JSON") from exc
 
 
 def parse_state_row(row: list[Any]) -> FlightState | None:
@@ -177,28 +250,11 @@ def parse_state_row(row: list[Any]) -> FlightState | None:
 def fetch_opensky_states(bounds: Bounds, timeout: int) -> tuple[int, list[FlightState]]:
     """Fetch live flight states from OpenSky in the given bounds."""
     query = urlencode(bounds.to_query_params())
-    request = Request(
+    payload = request_json(
         f"{OPENSKY_STATES_URL}?{query}",
-        headers={"User-Agent": USER_AGENT},
-        method="GET",
+        timeout=timeout,
+        provider="OpenSky",
     )
-
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            if response.status != 200:
-                raise FlightDataError(f"OpenSky returned status code: {response.status}")
-            raw = response.read().decode("utf-8")
-    except HTTPError as exc:
-        raise FlightDataError(f"OpenSky request failed: HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise FlightDataError(f"OpenSky network error: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise FlightDataError("OpenSky request timed out") from exc
-
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise FlightDataError("OpenSky returned invalid JSON") from exc
 
     server_time = _safe_int(payload.get("time")) or int(time.time())
     rows = payload.get("states") or []
@@ -212,19 +268,255 @@ def fetch_opensky_states(bounds: Bounds, timeout: int) -> tuple[int, list[Flight
     return server_time, flights
 
 
+def _is_inside_bounds(lat: float | None, lon: float | None, bounds: Bounds) -> bool:
+    if lat is None or lon is None:
+        return True
+    return bounds.min_lat <= lat <= bounds.max_lat and bounds.min_lon <= lon <= bounds.max_lon
+
+
+def _bbox_size_km(bounds: Bounds) -> tuple[float, float]:
+    mid_lat = (bounds.min_lat + bounds.max_lat) / 2.0
+    lat_km = abs(bounds.max_lat - bounds.min_lat) * 111.32
+    lon_km = abs(bounds.max_lon - bounds.min_lon) * 111.32 * max(
+        0.2, math.cos(math.radians(mid_lat))
+    )
+    return max(1e-6, lat_km), max(1e-6, lon_km)
+
+
+def _required_radius_nm(height_km: float, width_km: float, rows: int, cols: int) -> float:
+    step_h = height_km / (rows - 1) if rows > 1 else height_km
+    step_w = width_km / (cols - 1) if cols > 1 else width_km
+    # Extra margin keeps edge/cell overlap more stable.
+    margin_km = 35.0
+    return (0.5 * math.hypot(step_h, step_w) + margin_km) / 1.852
+
+
+def plan_adsblol_queries(
+    bounds: Bounds,
+    *,
+    max_queries: int,
+    max_radius_nm: int = 250,
+) -> list[tuple[float, float, int]]:
+    budget = max(1, min(max_queries, 64))
+    height_km, width_km = _bbox_size_km(bounds)
+
+    best_cover: tuple[int, float, int, int] | None = None
+    best_effort: tuple[int, float, int, int] | None = None
+    for rows in range(1, budget + 1):
+        max_cols = budget // rows
+        for cols in range(1, max_cols + 1):
+            query_count = rows * cols
+            radius_nm = _required_radius_nm(height_km, width_km, rows, cols)
+            candidate = (query_count, radius_nm, rows, cols)
+
+            if radius_nm <= max_radius_nm:
+                if (
+                    best_cover is None
+                    or candidate[0] < best_cover[0]
+                    or (candidate[0] == best_cover[0] and candidate[1] < best_cover[1])
+                ):
+                    best_cover = candidate
+            elif best_effort is None or candidate[1] < best_effort[1]:
+                best_effort = candidate
+
+    selected = best_cover or best_effort
+    if selected is None:
+        center_lat = (bounds.min_lat + bounds.max_lat) / 2.0
+        center_lon = (bounds.min_lon + bounds.max_lon) / 2.0
+        return [(center_lat, center_lon, max_radius_nm)]
+
+    _, needed_radius_nm, rows, cols = selected
+    radius_nm = max(40, min(max_radius_nm, int(math.ceil(needed_radius_nm))))
+
+    if rows == 1:
+        lat_values = [(bounds.min_lat + bounds.max_lat) / 2.0]
+    else:
+        lat_step = (bounds.max_lat - bounds.min_lat) / (rows - 1)
+        lat_values = [bounds.min_lat + (lat_step * i) for i in range(rows)]
+
+    if cols == 1:
+        lon_values = [(bounds.min_lon + bounds.max_lon) / 2.0]
+    else:
+        lon_step = (bounds.max_lon - bounds.min_lon) / (cols - 1)
+        lon_values = [bounds.min_lon + (lon_step * j) for j in range(cols)]
+
+    queries: list[tuple[float, float, int]] = []
+    for lat in lat_values:
+        for lon in lon_values:
+            queries.append((round(lat, 4), round(lon, 4), radius_nm))
+    return queries
+
+
+def parse_adsblol_aircraft(row: dict[str, Any], now_ts: int) -> FlightState | None:
+    if not isinstance(row, dict):
+        return None
+
+    icao24 = str(row.get("hex") or "").strip().lower()
+    if not icao24:
+        return None
+
+    callsign = str(row.get("flight") or "").strip()
+    if not callsign:
+        callsign = str(row.get("r") or "").strip()
+
+    lat = _safe_float(row.get("lat"))
+    lon = _safe_float(row.get("lon"))
+
+    alt_baro_raw = row.get("alt_baro")
+    baro_altitude_m: float | None = None
+    on_ground = False
+    if isinstance(alt_baro_raw, str) and alt_baro_raw.strip().lower() == "ground":
+        on_ground = True
+    else:
+        baro_altitude_m = _feet_to_meters(_safe_float(alt_baro_raw))
+
+    geo_altitude_m = _feet_to_meters(_safe_float(row.get("alt_geom")))
+    speed_mps = _knots_to_mps(_safe_float(row.get("gs")))
+    true_track_deg = _safe_float(row.get("track"))
+    geom_rate_fpm = _safe_float(row.get("geom_rate"))
+    if geom_rate_fpm is None:
+        geom_rate_fpm = _safe_float(row.get("baro_rate"))
+    vertical_rate_mps = _fpm_to_mps(geom_rate_fpm)
+
+    if not on_ground and (_safe_float(row.get("gs")) or 0.0) <= 1.0 and baro_altitude_m is None:
+        on_ground = True
+
+    seen_seconds = _safe_float(row.get("seen"))
+    seen_pos_seconds = _safe_float(row.get("seen_pos"))
+    last_contact = now_ts - int(round(seen_seconds)) if seen_seconds is not None else now_ts
+    time_position = (
+        now_ts - int(round(seen_pos_seconds)) if seen_pos_seconds is not None else last_contact
+    )
+
+    squawk = str(row.get("squawk")).strip() if row.get("squawk") is not None else None
+    spi = bool(row.get("spi"))
+
+    return FlightState(
+        icao24=icao24,
+        callsign=callsign,
+        origin_country="Unknown",
+        time_position=max(0, time_position),
+        last_contact=max(0, last_contact),
+        longitude=lon,
+        latitude=lat,
+        baro_altitude_m=baro_altitude_m,
+        on_ground=on_ground,
+        velocity_mps=speed_mps,
+        true_track_deg=true_track_deg,
+        vertical_rate_mps=vertical_rate_mps,
+        geo_altitude_m=geo_altitude_m,
+        squawk=squawk,
+        spi=spi,
+        position_source=None,
+    )
+
+
+def fetch_adsblol_states(
+    bounds: Bounds,
+    timeout: int,
+    *,
+    max_queries: int = 36,
+) -> tuple[int, list[FlightState]]:
+    queries = plan_adsblol_queries(bounds, max_queries=max_queries)
+    source_time = int(time.time())
+    merged: dict[str, FlightState] = {}
+    errors: list[str] = []
+
+    for lat, lon, radius_nm in queries:
+        url = ADSB_LOL_POINT_URL.format(
+            lat=f"{lat:.4f}",
+            lon=f"{lon:.4f}",
+            radius_nm=radius_nm,
+        )
+        try:
+            payload = request_json(url, timeout=timeout, provider="adsb.lol")
+        except FlightDataError as exc:
+            errors.append(str(exc))
+            continue
+
+        current_ts_ms = _safe_int(payload.get("now")) or _safe_int(payload.get("ctime"))
+        current_ts = int(current_ts_ms / 1000) if current_ts_ms is not None else int(time.time())
+        source_time = max(source_time, current_ts)
+
+        aircraft = payload.get("ac") or []
+        if not isinstance(aircraft, list):
+            continue
+        for row in aircraft:
+            parsed = parse_adsblol_aircraft(row, now_ts=current_ts)
+            if parsed is None:
+                continue
+            if not _is_inside_bounds(parsed.latitude, parsed.longitude, bounds):
+                continue
+
+            previous = merged.get(parsed.icao24)
+            if previous is None or (parsed.last_contact or 0) >= (previous.last_contact or 0):
+                merged[parsed.icao24] = parsed
+
+    if not merged and errors and len(errors) == len(queries):
+        raise FlightDataError(
+            f"adsb.lol failed for all {len(queries)} requests. Last error: {errors[-1]}"
+        )
+
+    flights = sorted(merged.values(), key=lambda item: item.last_contact or 0, reverse=True)
+    return source_time, flights
+
+
+def fetch_states_with_failover(
+    bounds: Bounds,
+    *,
+    timeout: int,
+    providers: list[str],
+    adsb_max_queries: int,
+) -> tuple[int, list[FlightState], str, list[str]]:
+    failures: list[str] = []
+    for provider in providers:
+        try:
+            if provider == "opensky":
+                source_time, flights = fetch_opensky_states(bounds, timeout=timeout)
+            elif provider == "adsb-lol":
+                source_time, flights = fetch_adsblol_states(
+                    bounds,
+                    timeout=timeout,
+                    max_queries=adsb_max_queries,
+                )
+            else:
+                failures.append(f"{provider}: unsupported provider")
+                continue
+            return source_time, flights, provider, failures
+        except FlightDataError as exc:
+            failures.append(f"{provider}: {exc}")
+
+    joined = " | ".join(failures) if failures else "no provider configured"
+    raise FlightDataError(f"All providers failed. {joined}")
+
+
 class MiddleEastFlightTracker:
     """Tracker wrapper with short trail history."""
 
-    def __init__(self, bounds: Bounds, timeout: int = 15, history_points: int = 12) -> None:
+    def __init__(
+        self,
+        bounds: Bounds,
+        timeout: int = 15,
+        history_points: int = 12,
+        providers: list[str] | None = None,
+        adsb_max_queries: int = 36,
+    ) -> None:
         self.bounds = bounds
         self.timeout = timeout
         self.history_points = max(2, history_points)
+        self.providers = providers or ["opensky", "adsb-lol"]
+        self.adsb_max_queries = max(1, min(adsb_max_queries, 64))
         self._trails: dict[str, deque[dict[str, float | int]]] = defaultdict(
             lambda: deque(maxlen=self.history_points)
         )
 
     def snapshot(self) -> dict[str, Any]:
-        source_time, flights = fetch_opensky_states(self.bounds, self.timeout)
+        source_time, flights, source_provider, provider_failures = fetch_states_with_failover(
+            self.bounds,
+            timeout=self.timeout,
+            providers=self.providers,
+            adsb_max_queries=self.adsb_max_queries,
+        )
         now_ts = int(time.time())
         active_icao: set[str] = set()
 
@@ -249,6 +541,8 @@ class MiddleEastFlightTracker:
         return {
             "fetched_at": now_ts,
             "source_time": source_time,
+            "source_provider": source_provider,
+            "provider_failures": provider_failures,
             "bounds": {
                 "min_lat": self.bounds.min_lat,
                 "max_lat": self.bounds.max_lat,
@@ -348,7 +642,14 @@ def render_cli_snapshot(snapshot: dict[str, Any], max_results: int) -> str:
     )
     total = snapshot.get("flight_count", 0)
     shown = len(flights)
-    head = f"Middle East live snapshot | Updated: {title_ts} | Total {total}, Showing {shown}"
+    provider = snapshot.get("source_provider", "unknown")
+    head = (
+        f"Middle East live snapshot | Source: {provider} | Updated: {title_ts} "
+        f"| Total {total}, Showing {shown}"
+    )
+    failures = snapshot.get("provider_failures") or []
+    if failures:
+        head = f"{head}\nFallback notes: {' ; '.join(failures)}"
     if not rows:
         return f"{head}\nNo flights to display."
     return f"{head}\n{format_table(rows, headers)}"
@@ -400,6 +701,8 @@ def build_api_payload(
     return {
         "fetched_at": snapshot.get("fetched_at"),
         "source_time": snapshot.get("source_time"),
+        "source_provider": snapshot.get("source_provider"),
+        "provider_failures": snapshot.get("provider_failures", []),
         "flight_count": len(snapshot.get("flights", [])),
         "shown_count": len(flights),
         "bounds": snapshot.get("bounds"),
@@ -637,7 +940,9 @@ def build_dashboard_html(bounds: Bounds, refresh_seconds: float) -> str:
         drawFlights(payload.flights || []);
         renderTable(payload.flights || []);
         const dt = new Date((payload.fetched_at || 0) * 1000);
-        meta.innerHTML = `Status: <span class="ok">online</span> | Flights: ${payload.flight_count || 0} | Shown: ${payload.shown_count || 0} | Updated: ${dt.toUTCString()} | Refresh: ${Math.round(refreshMs/1000)}s`;
+        const provider = payload.source_provider || "unknown";
+        const fallback = (payload.provider_failures || []).join(" ; ");
+        meta.innerHTML = `Status: <span class="ok">online</span> | Source: ${provider} | Flights: ${payload.flight_count || 0} | Shown: ${payload.shown_count || 0} | Updated: ${dt.toUTCString()} | Refresh: ${Math.round(refreshMs/1000)}s${fallback ? ` | Fallback: ${fallback}` : ""}`;
       } catch (error) {
         meta.innerHTML = `Status: <span class="danger">error</span> | ${error.message}`;
       }
@@ -765,15 +1070,36 @@ def add_region_args(parser: argparse.ArgumentParser) -> None:
         default=12,
         help="Number of trail points to retain per flight",
     )
+    parser.add_argument(
+        "--providers",
+        type=str,
+        default="opensky,adsb-lol",
+        help=(
+            "Ordered provider list, comma-separated. "
+            "Supported: opensky, adsb-lol (default: opensky,adsb-lol)"
+        ),
+    )
+    parser.add_argument(
+        "--adsb-max-queries",
+        type=int,
+        default=36,
+        help="Maximum fallback requests used by adsb-lol for large areas",
+    )
+
+
+def build_tracker_from_args(args: argparse.Namespace, bounds: Bounds) -> MiddleEastFlightTracker:
+    return MiddleEastFlightTracker(
+        bounds=bounds,
+        timeout=args.timeout,
+        history_points=args.history_points,
+        providers=parse_provider_order(args.providers),
+        adsb_max_queries=args.adsb_max_queries,
+    )
 
 
 def cmd_once(args: argparse.Namespace) -> int:
     bounds = resolve_bounds(args.region, args.bbox)
-    tracker = MiddleEastFlightTracker(
-        bounds=bounds,
-        timeout=args.timeout,
-        history_points=args.history_points,
-    )
+    tracker = build_tracker_from_args(args, bounds)
     snapshot = tracker.snapshot()
     print(render_cli_snapshot(snapshot, max_results=args.max_results))
     if args.json_out:
@@ -784,11 +1110,7 @@ def cmd_once(args: argparse.Namespace) -> int:
 
 def cmd_watch(args: argparse.Namespace) -> int:
     bounds = resolve_bounds(args.region, args.bbox)
-    tracker = MiddleEastFlightTracker(
-        bounds=bounds,
-        timeout=args.timeout,
-        history_points=args.history_points,
-    )
+    tracker = build_tracker_from_args(args, bounds)
 
     try:
         while True:
@@ -809,11 +1131,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     bounds = resolve_bounds(args.region, args.bbox)
-    tracker = MiddleEastFlightTracker(
-        bounds=bounds,
-        timeout=args.timeout,
-        history_points=args.history_points,
-    )
+    tracker = build_tracker_from_args(args, bounds)
     cache = SnapshotCache(
         tracker=tracker,
         min_refresh_seconds=max(2.0, args.interval),
@@ -838,7 +1156,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Real-time Middle East flight tracker (OpenSky API)",
+        description="Real-time Middle East flight tracker with provider failover",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

@@ -31,7 +31,9 @@ The main components of our system are:
 This repository now includes a standalone utility script for live flight tracking over Middle East airspace:
 
 - Script: `middle_east_flight_tracker.py`
-- Data source: OpenSky Network REST API (`/api/states/all`)
+- Data sources:
+  - OpenSky Network REST API (`/api/states/all`) as primary
+  - `adsb.lol` public API as automatic fallback
 - Modes:
   - `once`: fetch one snapshot in terminal
   - `watch`: refresh continuously in terminal
@@ -48,6 +50,22 @@ python middle_east_flight_tracker.py watch --region middle-east --interval 15
 
 # start dashboard at http://127.0.0.1:8787
 python middle_east_flight_tracker.py serve --host 127.0.0.1 --port 8787 --interval 10
+```
+
+### Provider Failover
+
+By default, provider order is `opensky,adsb-lol`.
+If OpenSky is unreachable (for example in some cloud networks), the tool auto-switches to `adsb-lol`.
+
+```bash
+# explicit provider order
+python middle_east_flight_tracker.py once --providers opensky,adsb-lol
+
+# use fallback source only
+python middle_east_flight_tracker.py once --providers adsb-lol
+
+# control fallback query budget for large regions
+python middle_east_flight_tracker.py once --providers adsb-lol --adsb-max-queries 24
 ```
 
 ### Custom Area (Bounding Box)
