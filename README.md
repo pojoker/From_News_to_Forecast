@@ -26,6 +26,58 @@ The main components of our system are:
 - Iterative event reasoning through LLMs to continuously refine predictions.
 - Application across multiple domains, including energy, exchange, bitcoin, and traffic forecasting.
 
+## Real-time Middle East Flight Tracker (Utility)
+
+This repository now includes a standalone utility script for live flight tracking over Middle East airspace:
+
+- Script: `middle_east_flight_tracker.py`
+- Data sources:
+  - OpenSky Network REST API (`/api/states/all`) as primary
+  - `adsb.lol` public API as automatic fallback
+- Modes:
+  - `once`: fetch one snapshot in terminal
+  - `watch`: refresh continuously in terminal
+  - `serve`: start a local web dashboard (canvas map + table)
+
+### Quick Start
+
+```bash
+# one-time snapshot
+python middle_east_flight_tracker.py once --region middle-east --max-results 20
+
+# continuous terminal monitor (refresh every 15s)
+python middle_east_flight_tracker.py watch --region middle-east --interval 15
+
+# start dashboard at http://127.0.0.1:8787
+python middle_east_flight_tracker.py serve --host 127.0.0.1 --port 8787 --interval 10
+```
+
+### Provider Failover
+
+By default, provider order is `opensky,adsb-lol`.
+If OpenSky is unreachable (for example in some cloud networks), the tool auto-switches to `adsb-lol`.
+
+```bash
+# explicit provider order
+python middle_east_flight_tracker.py once --providers opensky,adsb-lol
+
+# use fallback source only
+python middle_east_flight_tracker.py once --providers adsb-lol
+
+# control fallback query budget for large regions
+python middle_east_flight_tracker.py once --providers adsb-lol --adsb-max-queries 24
+```
+
+### Custom Area (Bounding Box)
+
+You can override region presets with:
+
+```bash
+python middle_east_flight_tracker.py once --bbox 12 42 24 64
+```
+
+`--bbox` order is: `MIN_LAT MAX_LAT MIN_LON MAX_LON`.
+
 ## Dataset
 ### Overview
 
